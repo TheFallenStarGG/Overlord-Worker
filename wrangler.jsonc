@@ -1,0 +1,10 @@
+{
+  "name": "overlord-api",
+  "main": "src/index.js",
+  "compatibility_date": "2025-01-01",
+  "workers_dev": true,
+  "keep_vars": true,
+  "kv_namespaces": [
+    { "binding": "ADMIN_KV", "id": "40cd4bd2aad84174b9d3ef85434824c4" }
+  ]
+}
