@@ -544,18 +544,41 @@ async function userSettings(env, user, url) {
   const g = await manageableGuild(env, user, guild);
   if (g.error) return json({ error: g.error }, g.status);
 
-  const [world, announce] = await pipeline(env, [
+  const [world, announce, rrRow] = await pipeline(env, [
     { sql: "SELECT value FROM kv WHERE file = ? AND key = 'settings'", args: ["world@" + guild] },
     { sql: "SELECT value FROM kv WHERE file = 'announce' AND key = ?", args: [guild] },
+    { sql: "SELECT value FROM kv WHERE file = ? AND key = 'reactionRoles'", args: ["world@" + guild] },
   ]);
   let s = {};
   let ann = {};
+  let panels = [];
   try {
     if (world.rows[0]) s = JSON.parse(world.rows[0].value) || {};
     if (announce.rows[0]) ann = JSON.parse(announce.rows[0].value) || {};
+    if (rrRow.rows[0]) {
+      const rawRr = JSON.parse(rrRow.rows[0].value) || {};
+      const map = rawRr.panels || {};
+      panels = Object.entries(map).map(([messageId, p]) => ({
+        messageId,
+        channelId: p.channelId,
+        mode: p.mode,
+        exclusive: Boolean(p.exclusive),
+        title: p.title || "Roles",
+        roleCount: Array.isArray(p.roles) ? p.roles.length : 0,
+      }));
+    }
   } catch {
     /* use the defaults */
   }
+
+  const titles = Object.entries(s.customTitles || {}).map(([id, t]) => ({
+    id,
+    name: t.name,
+    emoji: t.emoji || "🏷️",
+    price: t.price || 0,
+    roleId: t.roleId || null,
+    desc: t.desc || "",
+  }));
 
   const res = await discordGet(env, "/guilds/" + guild + "/channels");
   if (!res.ok) return json({ error: "I couldn't read that server's channels (" + (res.data.message || res.status) + ")" }, 502);
@@ -565,6 +588,16 @@ async function userSettings(env, user, url) {
     .filter((c) => [0, 4, 5].includes(c.type))
     .sort((a, b) => a.position - b.position)
     .map((c) => ({ id: c.id, name: c.name, type: c.type, parent: (c.parent_id && cats.get(c.parent_id)) || null }));
+
+  let roles = [];
+  const rolesRes = await discordGet(env, "/guilds/" + guild + "/roles");
+  if (rolesRes.ok && Array.isArray(rolesRes.data)) {
+    roles = rolesRes.data
+      .filter((r) => r.id !== guild && !r.managed)
+      .sort((a, b) => b.position - a.position)
+      .map((r) => ({ id: r.id, name: r.name, position: r.position, color: r.color || 0 }))
+      .slice(0, 200);
+  }
 
   const config = await getState(env, "config");
   return json({
@@ -582,6 +615,9 @@ async function userSettings(env, user, url) {
     },
     channels,
     commands: (config && config.commands) || [],
+    titles,
+    panels,
+    roles,
   });
 }
 
@@ -604,7 +640,7 @@ function cleanSettings(c) {
     }
     if (Object.keys(cmds).length) out.commands = cmds;
   }
-  for (const [k, max] of [["ignored", 50], ["games", 10]]) {
+    for (const [k, max] of [["ignored", 50], ["games", 10]]) {
     if (Array.isArray(c[k])) {
       if (c[k].length > max || !c[k].every((id) => typeof id === "string" && ID.test(id))) {
         return { error: "Bad " + k + " list (up to " + max + ")" };
@@ -612,6 +648,60 @@ function cleanSettings(c) {
       out[k] = c[k];
     }
   }
+
+  if (c.titleUpsert && typeof c.titleUpsert === "object") {
+    const t = c.titleUpsert;
+    const name = String(t.name || "").trim().slice(0, 64);
+    const price = Math.floor(Number(t.price));
+    if (!name || !Number.isFinite(price) || price < 0) return { error: "Bad title" };
+    const row = {
+      name,
+      price,
+      emoji: String(t.emoji || "🏷️").trim().slice(0, 32) || "🏷️",
+      desc: String(t.desc || "").trim().slice(0, 200),
+    };
+    if (t.id) {
+      const id = String(t.id).trim();
+      if (!/^title_custom_[a-z0-9_]{1,40}$/.test(id)) return { error: "Bad title id" };
+      row.id = id;
+    }
+    if (t.roleId === null || t.roleId === "") row.roleId = null;
+    else if (typeof t.roleId === "string" && ID.test(t.roleId)) row.roleId = t.roleId;
+    else if (t.roleId != null) return { error: "Bad title role" };
+    out.titleUpsert = row;
+  }
+  if (typeof c.titleRemove === "string" && c.titleRemove.trim()) {
+    out.titleRemove = c.titleRemove.trim().slice(0, 48);
+  }
+
+  if (typeof c.rrDelete === "string" && ID.test(c.rrDelete)) out.rrDelete = c.rrDelete;
+  if (c.rrPublish && typeof c.rrPublish === "object") {
+    const p = c.rrPublish;
+    const mode = String(p.mode || "");
+    if (!["buttons", "dropdown", "reactions"].includes(mode)) return { error: "Bad panel mode" };
+    if (!ID.test(String(p.channelId || ""))) return { error: "Pick a panel channel" };
+    const roles = Array.isArray(p.roles) ? p.roles : [];
+    if (!roles.length || roles.length > 25) return { error: "Panel needs 1–25 roles" };
+    const cleanRoles = [];
+    for (const r of roles) {
+      if (!ID.test(String(r.roleId || ""))) return { error: "Bad panel role" };
+      cleanRoles.push({
+        roleId: String(r.roleId),
+        emoji: String(r.emoji || "").trim().slice(0, 64),
+        description: String(r.description || "").trim().slice(0, 80),
+      });
+    }
+    out.rrPublish = {
+      mode,
+      channelId: String(p.channelId),
+      title: String(p.title || "Pick your roles").trim().slice(0, 100),
+      description: String(p.description || "").trim().slice(0, 1000),
+      exclusive: Boolean(p.exclusive),
+      color: Number.isFinite(Number(p.color)) ? Number(p.color) : 0x5865f2,
+      roles: cleanRoles,
+    };
+  }
+
   return { value: out };
 }
 
