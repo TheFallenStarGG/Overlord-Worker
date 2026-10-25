@@ -7,6 +7,8 @@ const ACTIONS = {
   blacklist: { ownerOnly: false },
   broadcast: { ownerOnly: true },
   coins: { ownerOnly: true },
+  wipeUser: { ownerOnly: true },
+  wipeGuild: { ownerOnly: true },
 };
 
 export default {
