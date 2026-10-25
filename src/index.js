@@ -51,6 +51,9 @@ export default {
       if (path === "/api/logs" && GET) {
         return withAdmin(request, env, () => fetchLogs(env, url));
       }
+      if (path === "/api/host-logs" && GET) {
+        return withAdmin(request, env, () => fetchHostLogs(env, url));
+      }
       if (path === "/api/inbox" && GET) {
         return withAdmin(request, env, () => fetchInbox(env, url));
       }
@@ -292,6 +295,56 @@ async function fetchLogs(env, url) {
   if (!res.ok) return json({ error: "Discord: " + (res.data.message || res.status) }, 502);
 
   return json({ logs: (res.data || []).map(mapMessage), fetchedAt: new Date().toISOString() });
+}
+
+// Raw console from bot-hosting.net — on demand only (no Turso writes).
+// Skips lines that are already the bot's structured logging() output so the
+// admin panel doesn't show the same event twice. Keeps stacks, TypeErrors, etc.
+async function fetchHostLogs(env, url) {
+  const key = env.BOTHOSTING_API_KEY;
+  const depId = env.BOTHOSTING_DEPLOYMENT_ID;
+  if (!key || !depId) {
+    return json({
+      error: "Host logs not configured. Set BOTHOSTING_API_KEY and BOTHOSTING_DEPLOYMENT_ID on the Worker.",
+      lines: [],
+      state: null,
+    }, 503);
+  }
+
+  const size = Math.min(500, Math.max(50, parseInt(url.searchParams.get("size") || "200", 10) || 200));
+  const res = await fetch(
+    `https://bot-hosting.net/api/v1/deployments/${encodeURIComponent(depId)}/logs?size=${size}`,
+    { headers: { Authorization: `Bearer ${key}` } }
+  );
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return json({ error: `bot-hosting ${res.status}: ${text.slice(0, 200)}`, lines: [], state: null }, 502);
+  }
+
+  const data = await res.json();
+  const raw = Array.isArray(data.lines) ? data.lines : [];
+
+  // Matches: 2026-10-04 12:34:56 | INFO  | Title
+  const structured = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| (INFO|WARN|ERROR)\s*\|/;
+  const boring = /Boss spawned|Admin panel link ready|Admin panel link is off/i;
+
+  const lines = [];
+  for (const line of raw) {
+    const s = String(line ?? "");
+    if (!s.trim()) continue;
+    if (structured.test(s)) continue; // already in Discord log channel as embeds
+    if (boring.test(s)) continue;
+    lines.push(s);
+  }
+
+  return json({
+    lines,
+    rawCount: raw.length,
+    state: data.state ?? null,
+    settled: data.settled ?? null,
+    fetchedAt: new Date().toISOString(),
+  });
 }
 
 async function fetchInbox(env, url) {
