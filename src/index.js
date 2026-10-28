@@ -26,6 +26,10 @@ export default {
       if (path === "/auth/login") return startLogin(env);
       if (path === "/auth/callback") return handleCallback(url, env);
 
+      if (path === "/webhooks/topgg" && request.method === "POST") {
+        return handleTopggWebhook(request, env);
+      }
+      
       // ----- Anyone who is logged in -----
       if (path === "/api/me") {
         return withUser(request, env, async (user) =>
@@ -409,6 +413,114 @@ async function fetchPlayer(env, url) {
   });
 }
 
+async function handleTopggWebhook(request, env) {
+  const secret = env.TOPGG_WEBHOOK_SECRET;
+  if (!secret) {
+    return json({ error: "TOPGG_WEBHOOK_SECRET is not set" }, 503);
+  }
+
+  // v1: must verify HMAC over the raw body
+  const rawBody = await request.text();
+  const signatureHeader = request.headers.get("x-topgg-signature") || "";
+
+  if (!(await verifyTopggSignature(rawBody, signatureHeader, secret))) {
+    return json({ error: "Invalid signature" }, 401);
+  }
+
+  let body;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return json({ error: "Bad JSON" }, 400);
+  }
+
+  // Dashboard "test" ping
+  if (body.type === "webhook.test" || body.type === "test") {
+    return json({ ok: true, test: true });
+  }
+
+  let userId = null;
+  let weight = 1;
+  let isWeekend = false;
+
+  if (body.type === "vote.create" && body.data) {
+    userId = String(body.data.user?.platform_id || body.data.user?.id || "");
+    weight = Number(body.data.weight) || 1;
+    isWeekend = weight >= 2;
+  } else if (body.type === "upvote" || body.user) {
+    // legacy-shaped payload (unlikely on v1, still safe)
+    userId = String(body.user || "");
+    isWeekend = Boolean(body.isWeekend);
+    weight = isWeekend ? 2 : 1;
+  } else {
+    return json({ ok: true, ignored: String(body.type || "unknown") });
+  }
+
+  if (!ID.test(userId)) {
+    return json({ error: "No valid Discord user id in payload" }, 400);
+  }
+
+  try {
+    await ensureTables(env);
+    await sql(
+      env,
+      "INSERT INTO admin_queue (action, payload, by_id, by_name, created) VALUES (?, ?, ?, ?, ?)",
+      [
+        "topggVote",
+        JSON.stringify({ userId, weight, isWeekend }),
+        "topgg",
+        "top.gg",
+        Date.now(),
+      ]
+    );
+  } catch (err) {
+    return json({ error: String(err.message || err).slice(0, 200) }, 500);
+  }
+
+  return json({ ok: true });
+}
+
+async function verifyTopggSignature(rawBody, signatureHeader, secret) {
+  try {
+    // Header format: t=TIMESTAMP,v1=HEX_SIGNATURE
+    const parts = Object.fromEntries(
+      String(signatureHeader)
+        .split(",")
+        .map((p) => p.trim().split("="))
+        .filter((p) => p.length === 2)
+    );
+    const timestamp = parts.t;
+    const received = parts.v1;
+    if (!timestamp || !received) return false;
+
+    // Reject very old timestamps (15 minutes)
+    const ts = Number(timestamp);
+    if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 15 * 60) {
+      return false;
+    }
+
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const data = new TextEncoder().encode(`${timestamp}.${rawBody}`);
+    const sigBuf = await crypto.subtle.sign("HMAC", key, data);
+    const expected = [...new Uint8Array(sigBuf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+    if (expected.length !== received.length) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) {
+      diff |= expected.charCodeAt(i) ^ received.charCodeAt(i);
+    }
+    return diff === 0;
+  } catch {
+    return false;
+  }
+}
+    
 // ---------- Queue: ask the bot to do something and wait for its answer ----------
 
 async function enqueueAndWait(env, user, action, payload) {
