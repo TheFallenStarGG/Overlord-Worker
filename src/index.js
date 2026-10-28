@@ -26,8 +26,14 @@ export default {
       if (path === "/auth/login") return startLogin(env);
       if (path === "/auth/callback") return handleCallback(url, env);
 
-      if (path === "/webhooks/topgg" && request.method === "POST") {
-        return handleTopggWebhook(request, env);
+      if (path === "/webhooks/topgg" || path === "/webhooks/topgg/") {
+        if (request.method === "GET") {
+          return json({ ok: true, webhook: true, hint: "POST only for top.gg" });
+        }
+        if (request.method === "POST") {
+          return handleTopggWebhook(request, env);
+        }
+        return json({ error: "Method not allowed" }, 405);
       }
       
       // ----- Anyone who is logged in -----
@@ -414,50 +420,108 @@ async function fetchPlayer(env, url) {
 }
 
 async function handleTopggWebhook(request, env) {
-  // TEMP: accept everything so we can confirm top.gg can reach the Worker
-  const rawBody = await request.text();
-  let body = {};
-  try {
-    body = JSON.parse(rawBody || "{}");
-  } catch (_) {}
-
-  if (body.type === "webhook.test" || body.type === "test") {
-    return json({ ok: true, test: true, temp: true });
+  const secret = env.TOPGG_WEBHOOK_SECRET;
+  if (!secret) {
+    return json({ error: "TOPGG_WEBHOOK_SECRET is not set" }, 503);
   }
 
-  // still queue real votes if payload is there (optional during test)
-  return json({ ok: true, temp: true, type: body.type || null });
+  const rawBody = await request.text();
+  const signatureHeader = request.headers.get("x-topgg-signature") || "";
+
+  const okSig = await verifyTopggSignature(rawBody, signatureHeader, secret);
+  if (!okSig) {
+    return json(
+      {
+        error: "Invalid signature",
+        hasHeader: Boolean(signatureHeader),
+        bodyLen: rawBody.length,
+      },
+      401
+    );
+  }
+
+  let body;
+  try {
+    body = JSON.parse(rawBody || "{}");
+  } catch {
+    return json({ error: "Bad JSON" }, 400);
+  }
+
+  if (body.type === "webhook.test" || body.type === "test") {
+    return json({ ok: true, test: true });
+  }
+
+  let userId = null;
+  let weight = 1;
+  let isWeekend = false;
+
+  if (body.type === "vote.create" && body.data) {
+    userId = String(body.data.user?.platform_id || body.data.user?.id || "");
+    weight = Number(body.data.weight) || 1;
+    isWeekend = weight >= 2;
+  } else if (body.user) {
+    userId = String(body.user || "");
+    isWeekend = Boolean(body.isWeekend);
+    weight = isWeekend ? 2 : 1;
+  } else {
+    return json({ ok: true, ignored: String(body.type || "unknown") });
+  }
+
+  if (!ID.test(userId)) {
+    return json({ error: "No valid Discord user id", userId }, 400);
+  }
+
+  try {
+    await ensureTables(env);
+    await sql(
+      env,
+      "INSERT INTO admin_queue (action, payload, by_id, by_name, created) VALUES (?, ?, ?, ?, ?)",
+      [
+        "topggVote",
+        JSON.stringify({ userId, weight, isWeekend }),
+        "topgg",
+        "top.gg",
+        Date.now(),
+      ]
+    );
+  } catch (err) {
+    return json({ error: String(err.message || err).slice(0, 200) }, 500);
+  }
+
+  return json({ ok: true });
 }
 
 async function verifyTopggSignature(rawBody, signatureHeader, secret) {
   try {
-    // Header format: t=TIMESTAMP,v1=HEX_SIGNATURE
-    const parts = Object.fromEntries(
-      String(signatureHeader)
-        .split(",")
-        .map((p) => p.trim().split("="))
-        .filter((p) => p.length === 2)
-    );
+    const parts = {};
+    for (const piece of String(signatureHeader).split(",")) {
+      const idx = piece.indexOf("=");
+      if (idx === -1) continue;
+      const k = piece.slice(0, idx).trim();
+      const v = piece.slice(idx + 1).trim();
+      parts[k] = v;
+    }
     const timestamp = parts.t;
-    const received = parts.v1;
+    const received = (parts.v1 || "").toLowerCase();
     if (!timestamp || !received) return false;
 
-    // Reject very old timestamps (15 minutes)
     const ts = Number(timestamp);
-    if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 15 * 60) {
-      return false;
-    }
+    const nowSec = Date.now() / 1000;
+    const tsSec = ts > 1e12 ? ts / 1000 : ts;
+    if (!Number.isFinite(tsSec) || Math.abs(nowSec - tsSec) > 15 * 60) return false;
 
     const key = await crypto.subtle.importKey(
       "raw",
-      new TextEncoder().encode(secret),
+      new TextEncoder().encode(String(secret).trim()),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"]
     );
     const data = new TextEncoder().encode(`${timestamp}.${rawBody}`);
     const sigBuf = await crypto.subtle.sign("HMAC", key, data);
-    const expected = [...new Uint8Array(sigBuf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const expected = [...new Uint8Array(sigBuf)]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
 
     if (expected.length !== received.length) return false;
     let diff = 0;
@@ -469,6 +533,7 @@ async function verifyTopggSignature(rawBody, signatureHeader, secret) {
     return false;
   }
 }
+
     
 // ---------- Queue: ask the bot to do something and wait for its answer ----------
 
