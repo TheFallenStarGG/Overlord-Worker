@@ -35,7 +35,7 @@ export default {
         }
         return json({ error: "Method not allowed" }, 405);
       }
-      
+
       // ----- Anyone who is logged in -----
       if (path === "/api/me") {
         return withUser(request, env, async (user) =>
@@ -54,6 +54,23 @@ export default {
       }
       if (path === "/api/user/settings" && request.method === "POST") {
         return withUser(request, env, (user) => saveUserSettings(request, env, user));
+      }
+
+      // ----- Moderation (people with a moderation permission in the server) -----
+      if (path === "/api/user/mod/meta" && GET) {
+        return withUser(request, env, (user) => modMeta(env, user, url));
+      }
+      if (path === "/api/user/mod/cases" && GET) {
+        return withUser(request, env, (user) => modCases(env, user, url));
+      }
+      if (path === "/api/user/mod/members" && GET) {
+        return withUser(request, env, (user) => modMembers(env, user, url));
+      }
+      if (path === "/api/user/mod/bans" && GET) {
+        return withUser(request, env, (user) => modBans(env, user, url));
+      }
+      if (path === "/api/user/mod/action" && request.method === "POST") {
+        return withUser(request, env, (user) => modAction(request, env, user));
       }
 
       // ----- Admins only -----
@@ -534,7 +551,6 @@ async function verifyTopggSignature(rawBody, signatureHeader, secret) {
   }
 }
 
-    
 // ---------- Queue: ask the bot to do something and wait for its answer ----------
 
 async function enqueueAndWait(env, user, action, payload) {
@@ -648,6 +664,18 @@ function canManage(entry) {
   }
 }
 
+// Kick, Ban, Administrator, Manage Channels, Manage Server, Manage Messages, Manage Nicknames, Manage Roles, Moderate Members
+const MOD_BITS = 0x2n | 0x4n | 0x8n | 0x10n | 0x20n | 0x2000n | 0x8000000n | 0x10000000n | 0x10000000000n;
+
+function canModerate(entry) {
+  if (entry[2]) return true;
+  try {
+    return (BigInt(entry[1]) & MOD_BITS) !== 0n;
+  } catch {
+    return false;
+  }
+}
+
 const iconUrl = (id, hash) => (hash ? "https://cdn.discordapp.com/icons/" + id + "/" + hash + ".png?size=64" : null);
 
 function shapePlayer(u) {
@@ -698,6 +726,7 @@ async function userStats(env, user) {
     name: names.get(e[0]),
     icon: iconUrl(e[0], e[3]),
     canManage: canManage(e),
+    canModerate: canModerate(e),
     player: shapePlayer(players.get(e[0])),
   }));
   servers.sort((a, b) => (b.player ? b.player.coins : -1) - (a.player ? a.player.coins : -1));
@@ -717,52 +746,10 @@ async function manageableGuild(env, user, guild) {
   return { name: found[1] };
 }
 
-async function userSettings(env, user, url) {
-  const guild = url.searchParams.get("guild") || "";
-  if (!ID.test(guild)) return json({ error: "Pick a server" }, 400);
-  if (limited("get:" + user.id, 30, 60000)) return json({ error: "Slow down a little" }, 429);
-
-  const g = await manageableGuild(env, user, guild);
-  if (g.error) return json({ error: g.error }, g.status);
-
-  const [world, announce, rrRow] = await pipeline(env, [
-    { sql: "SELECT value FROM kv WHERE file = ? AND key = 'settings'", args: ["world@" + guild] },
-    { sql: "SELECT value FROM kv WHERE file = 'announce' AND key = ?", args: [guild] },
-    { sql: "SELECT value FROM kv WHERE file = ? AND key = 'reactionRoles'", args: ["world@" + guild] },
-  ]);
-  let s = {};
-  let ann = {};
-  let panels = [];
-  try {
-    if (world.rows[0]) s = JSON.parse(world.rows[0].value) || {};
-    if (announce.rows[0]) ann = JSON.parse(announce.rows[0].value) || {};
-    if (rrRow.rows[0]) {
-      const rawRr = JSON.parse(rrRow.rows[0].value) || {};
-      const map = rawRr.panels || {};
-      panels = Object.entries(map).map(([messageId, p]) => ({
-        messageId,
-        channelId: p.channelId,
-        mode: p.mode,
-        exclusive: Boolean(p.exclusive),
-        title: p.title || "Roles",
-        roleCount: Array.isArray(p.roles) ? p.roles.length : 0,
-      }));
-    }
-  } catch {
-    /* use the defaults */
-  }
-
-  const titles = Object.entries(s.customTitles || {}).map(([id, t]) => ({
-    id,
-    name: t.name,
-    emoji: t.emoji || "🏷️",
-    price: t.price || 0,
-    roleId: t.roleId || null,
-    desc: t.desc || "",
-  }));
-
+// The server's channels and roles, read with the bot's own token
+async function channelsAndRoles(env, guild) {
   const res = await discordGet(env, "/guilds/" + guild + "/channels");
-  if (!res.ok) return json({ error: "I couldn't read that server's channels (" + (res.data.message || res.status) + ")" }, 502);
+  if (!res.ok) return { error: "I couldn't read that server's channels (" + (res.data.message || res.status) + ")" };
   const raw = Array.isArray(res.data) ? res.data : [];
   const cats = new Map(raw.filter((c) => c.type === 4).map((c) => [c.id, c.name]));
   const channels = raw
@@ -779,6 +766,70 @@ async function userSettings(env, user, url) {
       .map((r) => ({ id: r.id, name: r.name, position: r.position, color: r.color || 0 }))
       .slice(0, 200);
   }
+  return { channels, roles };
+}
+
+const MOD_DEFAULT = { modlogChannelId: null, modRoleIds: [], dmUsers: true, warnActions: {} };
+const AUTOMOD_DEFAULT = {
+  invites: false, links: false, spam: false, caps: false, mentions: false, words: false,
+  punish: "delete", spamMessages: 6, spamSeconds: 8, maxMentions: 5, capsPercent: 70, capsMinLength: 12,
+  badWords: [], allowedDomains: [], ignoredChannels: [], ignoredRoles: [],
+};
+const RAID_DEFAULT = { enabled: true, joinWindowSec: 20, joinThreshold: 8, minAccountAgeHours: 24, action: "kick", lockOnRaid: true, alertChannelId: null };
+const WELCOME_DEFAULT = { enabled: false, channelId: null, message: "Welcome {user} to **{server}**!" };
+
+function parseRow(row, fallback) {
+  try {
+    return row ? JSON.parse(row.value) ?? fallback : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function userSettings(env, user, url) {
+  const guild = url.searchParams.get("guild") || "";
+  if (!ID.test(guild)) return json({ error: "Pick a server" }, 400);
+  if (limited("get:" + user.id, 30, 60000)) return json({ error: "Slow down a little" }, 429);
+
+  const g = await manageableGuild(env, user, guild);
+  if (g.error) return json({ error: g.error }, g.status);
+
+  const [world, announce, rrRow, modRow, raidRow, welcomeRow] = await pipeline(env, [
+    { sql: "SELECT value FROM kv WHERE file = ? AND key = 'settings'", args: ["world@" + guild] },
+    { sql: "SELECT value FROM kv WHERE file = 'announce' AND key = ?", args: [guild] },
+    { sql: "SELECT value FROM kv WHERE file = ? AND key = 'reactionRoles'", args: ["world@" + guild] },
+    { sql: "SELECT value FROM kv WHERE file = ? AND key = 'config'", args: ["moderation@" + guild] },
+    { sql: "SELECT value FROM kv WHERE file = ? AND key = 'config'", args: ["antiraid@" + guild] },
+    { sql: "SELECT value FROM kv WHERE file = ? AND key = 'welcome'", args: ["antiraid@" + guild] },
+  ]);
+  const s = parseRow(world.rows[0], {}) || {};
+  const ann = parseRow(announce.rows[0], {}) || {};
+  let panels = [];
+  const rawRr = parseRow(rrRow.rows[0], {}) || {};
+  panels = Object.entries(rawRr.panels || {}).map(([messageId, p]) => ({
+    messageId,
+    channelId: p.channelId,
+    mode: p.mode,
+    exclusive: Boolean(p.exclusive),
+    title: p.title || "Roles",
+    roleCount: Array.isArray(p.roles) ? p.roles.length : 0,
+  }));
+
+  const modCfg = parseRow(modRow.rows[0], {}) || {};
+  const raid = parseRow(raidRow.rows[0], {}) || {};
+  const welcome = parseRow(welcomeRow.rows[0], {}) || {};
+
+  const titles = Object.entries(s.customTitles || {}).map(([id, t]) => ({
+    id,
+    name: t.name,
+    emoji: t.emoji || "🏷️",
+    price: t.price || 0,
+    roleId: t.roleId || null,
+    desc: t.desc || "",
+  }));
+
+  const cr = await channelsAndRoles(env, guild);
+  if (cr.error) return json({ error: cr.error }, 502);
 
   const config = await getState(env, "config");
   return json({
@@ -794,12 +845,157 @@ async function userSettings(env, user, url) {
       ignored: Object.keys(s.disabledChannels || {}),
       games: Array.isArray(s.gameChannels) ? s.gameChannels : [],
     },
-    channels,
+    mod: {
+      prefix: s.prefix || "!!",
+      modlog: modCfg.modlogChannelId || null,
+      modRoles: Array.isArray(modCfg.modRoleIds) ? modCfg.modRoleIds : MOD_DEFAULT.modRoleIds,
+      dmUsers: modCfg.dmUsers !== false,
+      warnActions: modCfg.warnActions && typeof modCfg.warnActions === "object" ? modCfg.warnActions : {},
+      automod: { ...AUTOMOD_DEFAULT, ...(modCfg.automod || {}) },
+      antiraid: { ...RAID_DEFAULT, ...raid },
+      welcome: { ...WELCOME_DEFAULT, ...welcome },
+    },
+    channels: cr.channels,
     commands: (config && config.commands) || [],
     titles,
     panels,
-    roles,
+    roles: cr.roles,
   });
+}
+
+// Checks the moderation part of a settings save (the bot checks it all again)
+function cleanMod(m) {
+  if (!m || typeof m !== "object" || Array.isArray(m)) return { error: "Bad moderation settings" };
+  const out = {};
+  const isBool = (v) => typeof v === "boolean";
+  const isInt = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+  const isId = (v) => typeof v === "string" && ID.test(v);
+  const idList = (v, max) => Array.isArray(v) && v.length <= max && v.every(isId);
+  const chan = (v) => v === null || isId(v);
+  const strList = (v, max, len) => Array.isArray(v) && v.length <= max && v.every((x) => typeof x === "string" && x.length <= len);
+
+  if ("modlog" in m) {
+    if (!chan(m.modlog)) return { error: "Bad mod log channel" };
+    out.modlog = m.modlog;
+  }
+  if ("modRoles" in m) {
+    if (!idList(m.modRoles, 10)) return { error: "Pick up to 10 moderator roles" };
+    out.modRoles = m.modRoles;
+  }
+  if ("dmUsers" in m) {
+    if (!isBool(m.dmUsers)) return { error: "Bad DM setting" };
+    out.dmUsers = m.dmUsers;
+  }
+  if ("prefix" in m) {
+    const p = String(m.prefix ?? "").trim();
+    if (p.length > 5 || /\s/.test(p)) return { error: "Bad prefix" };
+    out.prefix = p;
+  }
+  if ("warnActions" in m) {
+    const w = m.warnActions;
+    if (!w || typeof w !== "object" || Array.isArray(w) || Object.keys(w).length > 20) return { error: "Bad automatic actions" };
+    const rules = {};
+    for (const [count, r] of Object.entries(w)) {
+      if (!isInt(Number(count), 1, 20) || !r || typeof r !== "object") return { error: "Bad automatic action" };
+      if (r.action === "mute") {
+        if (!isInt(r.duration, 60000, 28 * 86400000)) return { error: "Mute length must be 1 minute to 28 days" };
+        rules[count] = { action: "mute", duration: r.duration };
+      } else if (r.action === "kick" || r.action === "ban") {
+        rules[count] = { action: r.action };
+      } else return { error: "Automatic action must be mute, kick or ban" };
+    }
+    out.warnActions = rules;
+  }
+
+  const a = m.automod;
+  if (a !== undefined) {
+    if (!a || typeof a !== "object") return { error: "Bad automod settings" };
+    const o = {};
+    for (const k of ["invites", "links", "spam", "caps", "mentions", "words"]) {
+      if (k in a) {
+        if (!isBool(a[k])) return { error: "Bad automod switch" };
+        o[k] = a[k];
+      }
+    }
+    if ("punish" in a) {
+      if (!["delete", "warn"].includes(a.punish)) return { error: "Automod punishment must be delete or warn" };
+      o.punish = a.punish;
+    }
+    for (const [k, lo, hi] of [["spamMessages", 3, 20], ["spamSeconds", 2, 60], ["maxMentions", 2, 50], ["capsPercent", 40, 100]]) {
+      if (k in a) {
+        if (!isInt(a[k], lo, hi)) return { error: "Bad automod number (" + k + ")" };
+        o[k] = a[k];
+      }
+    }
+    if ("badWords" in a) {
+      if (!strList(a.badWords, 100, 40)) return { error: "Blocked words: up to 100, 40 characters each" };
+      o.badWords = a.badWords;
+    }
+    if ("allowedDomains" in a) {
+      if (!strList(a.allowedDomains, 50, 100)) return { error: "Allowed domains: up to 50" };
+      o.allowedDomains = a.allowedDomains;
+    }
+    if ("ignoredChannels" in a) {
+      if (!idList(a.ignoredChannels, 50)) return { error: "Bad ignored channels" };
+      o.ignoredChannels = a.ignoredChannels;
+    }
+    if ("ignoredRoles" in a) {
+      if (!idList(a.ignoredRoles, 50)) return { error: "Bad ignored roles" };
+      o.ignoredRoles = a.ignoredRoles;
+    }
+    if (Object.keys(o).length) out.automod = o;
+  }
+
+  const r = m.antiraid;
+  if (r !== undefined) {
+    if (!r || typeof r !== "object") return { error: "Bad anti-raid settings" };
+    const o = {};
+    if ("enabled" in r) {
+      if (!isBool(r.enabled)) return { error: "Bad anti-raid switch" };
+      o.enabled = r.enabled;
+    }
+    if ("lockOnRaid" in r) {
+      if (!isBool(r.lockOnRaid)) return { error: "Bad soft-lock switch" };
+      o.lockOnRaid = r.lockOnRaid;
+    }
+    for (const [k, lo, hi] of [["joinThreshold", 3, 50], ["joinWindowSec", 5, 120], ["minAccountAgeHours", 0, 720]]) {
+      if (k in r) {
+        if (!isInt(r[k], lo, hi)) return { error: "Bad anti-raid number (" + k + ")" };
+        o[k] = r[k];
+      }
+    }
+    if ("action" in r) {
+      if (!["kick", "ban", "timeout"].includes(r.action)) return { error: "Anti-raid action must be kick, ban or timeout" };
+      o.action = r.action;
+    }
+    if ("alertChannelId" in r) {
+      if (!chan(r.alertChannelId)) return { error: "Bad alert channel" };
+      o.alertChannelId = r.alertChannelId;
+    }
+    if (Object.keys(o).length) out.antiraid = o;
+  }
+
+  const w = m.welcome;
+  if (w !== undefined) {
+    if (!w || typeof w !== "object") return { error: "Bad welcome settings" };
+    const o = {};
+    if ("enabled" in w) {
+      if (!isBool(w.enabled)) return { error: "Bad welcome switch" };
+      o.enabled = w.enabled;
+    }
+    if ("channelId" in w) {
+      if (!chan(w.channelId)) return { error: "Bad welcome channel" };
+      o.channelId = w.channelId;
+    }
+    if ("message" in w) {
+      const text = String(w.message || "").trim();
+      if (!text || text.length > 1800) return { error: "The welcome message must be 1–1800 characters" };
+      o.message = text;
+    }
+    if (Object.keys(o).length) out.welcome = o;
+  }
+
+  return { value: out };
 }
 
 function cleanSettings(c) {
@@ -821,7 +1017,7 @@ function cleanSettings(c) {
     }
     if (Object.keys(cmds).length) out.commands = cmds;
   }
-    for (const [k, max] of [["ignored", 50], ["games", 10]]) {
+  for (const [k, max] of [["ignored", 50], ["games", 10]]) {
     if (Array.isArray(c[k])) {
       if (c[k].length > max || !c[k].every((id) => typeof id === "string" && ID.test(id))) {
         return { error: "Bad " + k + " list (up to " + max + ")" };
@@ -883,6 +1079,12 @@ function cleanSettings(c) {
     };
   }
 
+  if (c.mod !== undefined) {
+    const r = cleanMod(c.mod);
+    if (r.error) return r;
+    if (Object.keys(r.value).length) out.mod = r.value;
+  }
+
   return { value: out };
 }
 
@@ -902,6 +1104,325 @@ async function saveUserSettings(request, env, user) {
   // The bot checks Manage Server again before it changes anything
   const { status, result } = await enqueueAndWait(env, user, "guildSettings", { guildId: guild, changes: checked.value });
   await audit(env, user, "server-settings", g.name + ": " + Object.keys(checked.value).join(", ") + (result ? " → " + result : ""), status);
+  return json({ ok: status === "done", status, result });
+}
+
+// ---------- Moderation (dashboard) ----------
+
+// In the server, bot present, and some moderation permission (or one of the bot's moderator roles)
+async function modGuild(env, user, guild) {
+  const list = await userGuilds(env, user);
+  if (!list) return { error: "Log in again to refresh your server list", status: 409 };
+  const entry = list.find((e) => e[0] === guild);
+  if (!entry) return { error: "You're not in that server", status: 403 };
+  const all = (await getState(env, "guilds")) || [];
+  const found = all.find((g) => g[0] === guild);
+  if (!found) return { error: "The bot isn't in that server", status: 404 };
+
+  const manage = canManage(entry);
+  if (!manage && !canModerate(entry)) {
+    // They may still hold a moderator role that was set up with the bot
+    const { rows } = await sql(env, "SELECT value FROM kv WHERE file = ? AND key = 'config'", ["moderation@" + guild]);
+    const cfg = parseRow(rows[0], {}) || {};
+    const roleIds = Array.isArray(cfg.modRoleIds) ? cfg.modRoleIds : [];
+    const res = roleIds.length ? await discordGet(env, "/guilds/" + guild + "/members/" + user.id) : null;
+    const mine = res && res.ok && Array.isArray(res.data.roles) ? res.data.roles : [];
+    if (!mine.some((r) => roleIds.includes(r))) {
+      return { error: "You don't have a moderation permission in that server", status: 403 };
+    }
+  }
+  return { name: found[1], manage };
+}
+
+async function modMeta(env, user, url) {
+  const guild = url.searchParams.get("guild") || "";
+  if (!ID.test(guild)) return json({ error: "Pick a server" }, 400);
+  if (limited("modget:" + user.id, 60, 60000)) return json({ error: "Slow down a little" }, 429);
+  const g = await modGuild(env, user, guild);
+  if (g.error) return json({ error: g.error }, g.status);
+  const cr = await channelsAndRoles(env, guild);
+  if (cr.error) return json({ error: cr.error }, 502);
+  return json({ guild: { id: guild, name: g.name }, manage: g.manage, channels: cr.channels, roles: cr.roles });
+}
+
+const nameCache = new Map();
+async function resolveNames(env, ids) {
+  const out = {};
+  let budget = 12;
+  for (const id of ids) {
+    if (nameCache.has(id)) {
+      out[id] = nameCache.get(id);
+      continue;
+    }
+    if (budget <= 0) continue;
+    budget--;
+    const res = await discordGet(env, "/users/" + id);
+    const name = res.ok ? res.data.global_name || res.data.username : null;
+    if (nameCache.size > 3000) nameCache.clear();
+    nameCache.set(id, name);
+    out[id] = name;
+  }
+  return out;
+}
+
+const CASE_TYPES = ["warn", "mute", "unmute", "kick", "ban", "tempban", "softban", "unban", "note"];
+
+async function modCases(env, user, url) {
+  const guild = url.searchParams.get("guild") || "";
+  if (!ID.test(guild)) return json({ error: "Pick a server" }, 400);
+  if (limited("modget:" + user.id, 60, 60000)) return json({ error: "Slow down a little" }, 429);
+  const g = await modGuild(env, user, guild);
+  if (g.error) return json({ error: g.error }, g.status);
+
+  const uid = url.searchParams.get("user") || "";
+  const type = url.searchParams.get("type") || "";
+  const before = Math.floor(Number(url.searchParams.get("before"))) || 0;
+  if (uid && !ID.test(uid)) return json({ error: "Bad user" }, 400);
+  if (type && !CASE_TYPES.includes(type)) return json({ error: "Bad case type" }, 400);
+
+  const file = "moderation@" + guild;
+  let where = "file = ? AND key LIKE 'case_%'";
+  const args = [file];
+  if (uid) {
+    where += " AND json_extract(value, '$.userId') = ?";
+    args.push(uid);
+  }
+  if (type) {
+    where += " AND json_extract(value, '$.type') = ?";
+    args.push(type);
+  }
+  if (before > 0) {
+    where += " AND CAST(SUBSTR(key, 6) AS INTEGER) < ?";
+    args.push(before);
+  }
+
+  const statements = [
+    { sql: "SELECT key, value FROM kv WHERE " + where + " ORDER BY CAST(SUBSTR(key, 6) AS INTEGER) DESC LIMIT 61", args },
+  ];
+  if (!uid && !type && !before) {
+    statements.push({
+      sql: "SELECT json_extract(value, '$.type') AS type, COUNT(*) AS n FROM kv WHERE file = ? AND key LIKE 'case_%' AND json_extract(value, '$.removed') = 0 GROUP BY type",
+      args: [file],
+    });
+  }
+  if (uid) {
+    statements.push({
+      sql: "SELECT COUNT(*) AS n FROM kv WHERE file = ? AND key LIKE 'case_%' AND json_extract(value, '$.userId') = ? AND json_extract(value, '$.type') = 'warn' AND json_extract(value, '$.removed') = 0",
+      args: [file, uid],
+    });
+  }
+  const results = await pipeline(env, statements);
+
+  const rows = results[0].rows;
+  const cases = [];
+  for (const r of rows.slice(0, 60)) {
+    try {
+      const c = JSON.parse(r.value);
+      cases.push({
+        id: c.id,
+        type: c.type,
+        userId: c.userId || null,
+        modId: c.modId || null,
+        reason: String(c.reason || ""),
+        at: c.at || 0,
+        until: c.until || null,
+        removed: Boolean(c.removed),
+      });
+    } catch {
+      /* skip a damaged row */
+    }
+  }
+
+  const ids = [...new Set(cases.flatMap((c) => [c.userId, c.modId]).filter(Boolean))];
+  const names = await resolveNames(env, ids);
+
+  const out = { cases, more: rows.length > 60, names };
+  if (!uid && !type && !before) {
+    out.counts = {};
+    for (const r of results[1].rows) if (r.type) out.counts[r.type] = r.n;
+  }
+  if (uid) out.activeWarnings = results[1].rows[0] ? results[1].rows[0].n : 0;
+  return json(out);
+}
+
+const avatarOf = (u) => {
+  if (u.avatar) return "https://cdn.discordapp.com/avatars/" + u.id + "/" + u.avatar + ".png?size=64";
+  let n = 0;
+  try {
+    n = Number((BigInt(u.id) >> 22n) % 6n);
+  } catch {
+    /* default avatar 0 */
+  }
+  return "https://cdn.discordapp.com/embed/avatars/" + n + ".png";
+};
+
+function shapeMember(m, inServer) {
+  const u = m.user || m;
+  return {
+    id: u.id,
+    name: u.global_name || u.username,
+    username: u.username,
+    nick: m.nick || null,
+    avatar: avatarOf(u),
+    bot: Boolean(u.bot),
+    inServer,
+    roles: inServer ? m.roles || [] : [],
+    joinedAt: inServer ? m.joined_at || null : null,
+    mutedUntil: inServer ? m.communication_disabled_until || null : null,
+  };
+}
+
+async function modMembers(env, user, url) {
+  const guild = url.searchParams.get("guild") || "";
+  if (!ID.test(guild)) return json({ error: "Pick a server" }, 400);
+  if (limited("modget:" + user.id, 60, 60000)) return json({ error: "Slow down a little" }, 429);
+  const g = await modGuild(env, user, guild);
+  if (g.error) return json({ error: g.error }, g.status);
+
+  const q = (url.searchParams.get("q") || "").trim().slice(0, 32);
+  if (!q) return json({ members: [] });
+
+  // A pasted ID: works even for people who already left
+  if (ID.test(q)) {
+    const m = await discordGet(env, "/guilds/" + guild + "/members/" + q);
+    if (m.ok && m.data.user) return json({ members: [shapeMember(m.data, true)] });
+    const u = await discordGet(env, "/users/" + q);
+    if (u.ok) return json({ members: [shapeMember({ user: u.data }, false)] });
+    return json({ members: [] });
+  }
+
+  const res = await discordGet(env, "/guilds/" + guild + "/members/search?limit=12&query=" + encodeURIComponent(q));
+  if (!res.ok) return json({ error: "Discord: " + (res.data.message || res.status) }, 502);
+  return json({ members: (Array.isArray(res.data) ? res.data : []).filter((m) => m.user).map((m) => shapeMember(m, true)) });
+}
+
+async function modBans(env, user, url) {
+  const guild = url.searchParams.get("guild") || "";
+  if (!ID.test(guild)) return json({ error: "Pick a server" }, 400);
+  if (limited("modget:" + user.id, 60, 60000)) return json({ error: "Slow down a little" }, 429);
+  const g = await modGuild(env, user, guild);
+  if (g.error) return json({ error: g.error }, g.status);
+
+  const res = await discordGet(env, "/guilds/" + guild + "/bans?limit=200");
+  if (!res.ok) return json({ error: "I couldn't read the ban list (" + (res.data.message || res.status) + "). I need the Ban Members permission." }, 502);
+  const bans = (Array.isArray(res.data) ? res.data : []).map((b) => ({
+    id: b.user.id,
+    name: b.user.global_name || b.user.username,
+    username: b.user.username,
+    avatar: avatarOf(b.user),
+    reason: b.reason || "",
+  }));
+  return json({ bans });
+}
+
+// Only known fields get through, each checked
+function cleanModAction(action, p) {
+  if (!p || typeof p !== "object") return { error: "Bad request" };
+  const text = (v, max) => String(v === undefined || v === null ? "" : v).trim().slice(0, max);
+  const DAY = 86400000;
+  const uid = text(p.userId, 25);
+  const reason = text(p.reason, 400);
+  const needUser = () => (ID.test(uid) ? null : "Pick a member first");
+  const dur = (min, max) => {
+    const n = Math.floor(Number(p.durationMs));
+    return Number.isFinite(n) && n >= min && n <= max ? n : null;
+  };
+
+  switch (action) {
+    case "warn":
+    case "note":
+      if (needUser()) return { error: needUser() };
+      if (!reason) return { error: "Write a reason" };
+      return { payload: { userId: uid, reason } };
+    case "mute": {
+      if (needUser()) return { error: needUser() };
+      const ms = p.durationMs === undefined ? 3600000 : dur(60000, 28 * DAY);
+      if (!ms) return { error: "Mute length must be 1 minute to 28 days" };
+      return { payload: { userId: uid, reason, durationMs: ms } };
+    }
+    case "unmute":
+    case "kick":
+    case "softban":
+    case "unban":
+      if (needUser()) return { error: needUser() };
+      return { payload: { userId: uid, reason } };
+    case "ban": {
+      if (needUser()) return { error: needUser() };
+      const days = p.deleteDays === undefined ? 0 : Math.floor(Number(p.deleteDays));
+      if (!Number.isInteger(days) || days < 0 || days > 7) return { error: "Delete 0–7 days of messages" };
+      return { payload: { userId: uid, reason, deleteDays: days } };
+    }
+    case "tempban": {
+      if (needUser()) return { error: needUser() };
+      const ms = dur(60000, 365 * DAY);
+      if (!ms) return { error: "Ban length must be 1 minute to 365 days" };
+      return { payload: { userId: uid, reason, durationMs: ms } };
+    }
+    case "nick":
+      if (needUser()) return { error: needUser() };
+      return { payload: { userId: uid, nick: text(p.nick, 32) } };
+    case "role": {
+      if (needUser()) return { error: needUser() };
+      const roleId = text(p.roleId, 25);
+      if (!ID.test(roleId)) return { error: "Pick a role" };
+      if (!["add", "remove"].includes(p.mode)) return { error: "Bad role mode" };
+      return { payload: { userId: uid, roleId, mode: p.mode } };
+    }
+    case "clearwarns":
+      if (needUser()) return { error: needUser() };
+      return { payload: { userId: uid } };
+    case "delwarn":
+    case "reason": {
+      const caseId = Math.floor(Number(p.caseId));
+      if (!Number.isInteger(caseId) || caseId < 1) return { error: "Bad case number" };
+      if (action === "reason" && !reason) return { error: "Write a reason" };
+      return { payload: action === "reason" ? { caseId, reason } : { caseId } };
+    }
+    case "slowmode": {
+      const channelId = text(p.channelId, 25);
+      const seconds = Math.floor(Number(p.seconds));
+      if (!ID.test(channelId)) return { error: "Pick a channel" };
+      if (!Number.isInteger(seconds) || seconds < 0 || seconds > 21600) return { error: "Slowmode is 0–21600 seconds" };
+      return { payload: { channelId, seconds } };
+    }
+    case "lock":
+    case "unlock": {
+      const channelId = text(p.channelId, 25);
+      if (!ID.test(channelId)) return { error: "Pick a channel" };
+      return { payload: { channelId, reason } };
+    }
+    case "purge": {
+      const channelId = text(p.channelId, 25);
+      const count = Math.floor(Number(p.count));
+      if (!ID.test(channelId)) return { error: "Pick a channel" };
+      if (!Number.isInteger(count) || count < 1 || count > 100) return { error: "Delete 1–100 messages" };
+      const filterUserId = text(p.filterUserId, 25);
+      if (filterUserId && !ID.test(filterUserId)) return { error: "Bad user filter" };
+      return { payload: { channelId, count, filterUserId: filterUserId || null, bots: p.bots === true } };
+    }
+    case "welcomeTest":
+      return { payload: {} };
+    default:
+      return { error: "Unknown action" };
+  }
+}
+
+async function modAction(request, env, user) {
+  const body = await request.json().catch(() => ({}));
+  const guild = String(body.guild || "");
+  if (!ID.test(guild)) return json({ error: "Pick a server" }, 400);
+  if (limited("modact:" + user.id, 20, 60000)) return json({ error: "Slow down, try again in a minute" }, 429);
+
+  const g = await modGuild(env, user, guild);
+  if (g.error) return json({ error: g.error }, g.status);
+
+  const action = String(body.action || "");
+  const checked = cleanModAction(action, body.payload);
+  if (checked.error) return json({ error: checked.error }, 400);
+
+  // The bot checks the person's permissions and role order again before doing anything
+  const { status, result } = await enqueueAndWait(env, user, "modAction", { guildId: guild, action, ...checked.payload });
+  await audit(env, user, "mod-" + action, g.name + ": " + (result || ""), status);
   return json({ ok: status === "done", status, result });
 }
 
@@ -1058,4 +1579,4 @@ async function hmac(secret, text) {
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/g, "");
-                         }
+}
